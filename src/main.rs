@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use clap::Parser;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +15,18 @@ struct Peer {
     url: String,
     key: String,
     sync_with: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// path to the config file
+    #[arg(short, long)]
+    config: String,
+
+    /// only print missing images
+    #[arg(short, long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -50,6 +63,21 @@ struct UploadResponse {
 struct Asset {
     id: String,
     checksum: String,
+
+    #[serde(alias = "originalFileName")]
+    file_name: String,
+
+    #[serde(alias = "deviceAssetId")]
+    device_asset_id: String,
+
+    #[serde(alias = "deviceId")]
+    device_id: String,
+
+    #[serde(alias = "fileCreatedAt")]
+    file_created_at: String,
+
+    #[serde(alias = "fileModifiedAt")]
+    file_modified_at: String,
 }
 
 impl SharedLink {
@@ -74,24 +102,14 @@ impl SharedLink {
         Ok(())
     }
 
-    async fn download_asset(&self, id: &str, client: &Client, dir: &Path) -> Result<PathBuf> {
+    async fn download_asset(&self, asset: &Asset, client: &Client, dir: &Path) -> Result<PathBuf> {
         let url = format!(
-            "{}/api/assets/{id}/original?key={}&edited=true",
-            self.base_url, self.key
+            "{}/api/assets/{}/original?key={}&edited=true",
+            self.base_url, asset.id, self.key
         );
         let res = client.get(url).send().await?;
 
-        let reg = regex::Regex::new(r#"filename\*\s*=\s*[^']*''([^;]+)"#)?;
-
-        let filename = if let Some(caps) =
-            reg.captures(res.headers()[reqwest::header::CONTENT_DISPOSITION].to_str()?)
-        {
-            caps.get(1).unwrap().as_str()
-        } else {
-            id
-        };
-
-        let dest_path = dir.join(filename);
+        let dest_path = dir.join(&asset.file_name);
 
         let mut dest_file = File::create(&dest_path)?;
 
@@ -101,13 +119,18 @@ impl SharedLink {
         Ok(dest_path.to_owned())
     }
 
-    async fn upload_asset(&self, client: &Client, asset_path: &Path) -> Result<()> {
+    async fn upload_asset(
+        &self,
+        client: &Client,
+        original_asset: &Asset,
+        asset_path: &Path,
+    ) -> Result<()> {
         // TODO: fill fields
         let form = reqwest::multipart::Form::new()
-            .text("deviceId", "TODO")
-            .text("deviceAssetId", "TODO")
-            .text("fileCreatedAt", "2025-12-04T18:49:20.532Z")
-            .text("fileModifiedAt", "2025-12-04T18:49:20.532Z")
+            .text("deviceId", original_asset.device_id.clone())
+            .text("deviceAssetId", original_asset.device_asset_id.clone())
+            .text("fileCreatedAt", original_asset.file_created_at.clone())
+            .text("fileModifiedAt", original_asset.file_modified_at.clone())
             .file("assetData", asset_path)
             .await?;
 
@@ -138,12 +161,22 @@ impl SharedLink {
         Ok(())
     }
 
-    async fn upload_missing(&mut self, other: &Self, client: &Client, dir: &Path) -> Result<()> {
+    async fn upload_missing(
+        &mut self,
+        other: &Self,
+        dry_run: bool,
+        client: &Client,
+        dir: &Path,
+    ) -> Result<()> {
         self.get_assets(client).await?;
         let missing = other.album.missing_from_other(&self.album);
         for asset in missing {
-            let asset_path = other.download_asset(&asset.id, client, dir).await?;
-            self.upload_asset(client, &asset_path).await?;
+            if dry_run {
+                println!("Missing asset {}", asset.file_name);
+                continue;
+            }
+            let asset_path = other.download_asset(&asset, client, dir).await?;
+            self.upload_asset(client, &asset, &asset_path).await?;
         }
         Ok(())
     }
@@ -164,7 +197,8 @@ impl Album {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let raw_config = fs::read_to_string("./config.toml")?;
+    let args = Args::parse();
+    let raw_config = fs::read_to_string(args.config)?;
     let config: Config = toml::from_str(&raw_config)?;
 
     let client = reqwest::Client::new();
@@ -182,7 +216,8 @@ async fn main() -> Result<()> {
             let tmp_dir = tempfile::Builder::new().prefix("iss").tempdir()?;
             let path = tmp_dir.path();
 
-            this.upload_missing(&other, &client, path).await?;
+            this.upload_missing(&other, args.dry_run, &client, path)
+                .await?;
         }
     }
 
