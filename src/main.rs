@@ -125,7 +125,6 @@ impl SharedLink {
         original_asset: &Asset,
         asset_path: &Path,
     ) -> Result<()> {
-        // TODO: fill fields
         let form = reqwest::multipart::Form::new()
             .text("deviceId", original_asset.device_id.clone())
             .text("deviceAssetId", original_asset.device_asset_id.clone())
@@ -137,8 +136,12 @@ impl SharedLink {
         let url = format!("{}/api/assets?key={}", self.base_url, self.key);
         let res = client.post(url).multipart(form).send().await?;
 
-        if res.status() != reqwest::StatusCode::OK {
-            bail!("Upload failed: {}", res.text().await?);
+        if !res.status().is_success() {
+            bail!(
+                "Upload failed with status {}: {}",
+                res.status(),
+                res.text().await?
+            );
         }
 
         let res = res.json::<UploadResponse>().await?;
@@ -170,9 +173,10 @@ impl SharedLink {
     ) -> Result<()> {
         self.get_assets(client).await?;
         let missing = other.album.missing_from_other(&self.album);
+        println!("{} asset are missing", missing.len());
         for asset in missing {
+            println!("Uploading asset {}", asset.file_name);
             if dry_run {
-                println!("Missing asset {}", asset.file_name);
                 continue;
             }
             let asset_path = other.download_asset(&asset, client, dir).await?;
@@ -208,10 +212,14 @@ async fn main() -> Result<()> {
         this.get_assets(&client).await?;
 
         for other_name in &peer.sync_with {
-            println!("Syncing {name} with {other_name} ...");
             let other = &config[other_name];
             let mut other = SharedLink::new(&other.url, &other.key, &client).await?;
             other.get_assets(&client).await?;
+
+            println!(
+                "Adding assets from {} ({}) to {} ({}) ...",
+                other_name, other.album.name, name, this.album.name,
+            );
 
             let tmp_dir = tempfile::Builder::new().prefix("iss").tempdir()?;
             let path = tmp_dir.path();
