@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,8 +12,7 @@ type Config = HashMap<String, Peer>;
 
 #[derive(Deserialize, Debug)]
 struct Peer {
-    url: String,
-    key: String,
+    shared_link: String,
     sync_with: Vec<String>,
 }
 
@@ -24,7 +23,7 @@ struct Args {
     #[arg(short, long)]
     config: String,
 
-    /// only print missing images
+    /// only print missing assets
     #[arg(short, long, default_value_t = false)]
     dry_run: bool,
 }
@@ -81,7 +80,10 @@ struct Asset {
 }
 
 impl SharedLink {
-    async fn new(base_url: &str, key: &str, client: &Client) -> Result<Self> {
+    async fn new(shared_link: &str, client: &Client) -> Result<Self> {
+        let mut s = shared_link.split("/share/");
+        let base_url = s.next().context("Invalid share link")?;
+        let key = s.next().context("Invalid share link")?;
         let url = format!("{base_url}/api/shared-links/me?key={key}");
         let res = client.get(url).send().await?;
 
@@ -208,12 +210,12 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
 
     for (name, peer) in &config {
-        let mut this = SharedLink::new(&peer.url, &peer.key, &client).await?;
+        let mut this = SharedLink::new(&peer.shared_link, &client).await?;
         this.get_assets(&client).await?;
 
         for other_name in &peer.sync_with {
             let other = &config[other_name];
-            let mut other = SharedLink::new(&other.url, &other.key, &client).await?;
+            let mut other = SharedLink::new(&other.shared_link, &client).await?;
             other.get_assets(&client).await?;
 
             println!(
