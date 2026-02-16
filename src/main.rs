@@ -1,12 +1,12 @@
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use futures::{StreamExt, TryStreamExt, stream};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
-use std::iter;
 use std::path::{Path, PathBuf};
 
 type Config = HashMap<String, Peer>;
@@ -109,73 +109,77 @@ impl SharedLink {
 
     async fn download_assets(
         &self,
-        assets: &mut Vec<Asset>,
+        assets: &mut [Asset],
         client: &Client,
         dir: &Path,
     ) -> Result<()> {
-        let mut results = Vec::new();
-        for asset in assets.iter() {
+        let mut download_stream = stream::iter(assets.iter_mut().map(|asset| {
             let url = format!(
                 "{}/api/assets/{}/original?key={}&edited=true",
                 self.base_url, asset.id, self.key
             );
-            let res = client.get(url).send().await?;
-            if !res.status().is_success() {
-                bail!("Download failed with status {}", res.status());
+            let asset_file_name = asset.file_name.clone();
+            let dir = dir.to_path_buf();
+            async move {
+                let res = client.get(&url).send().await?;
+                if !res.status().is_success() {
+                    bail!("Download failed for {}: {}", asset_file_name, res.status());
+                }
+                let bytes = res.bytes().await?;
+
+                let dest_path = dir.join(&asset_file_name);
+                asset.path = Some(dest_path.clone());
+                let mut dest_file = File::create(&dest_path)?;
+                dest_file.write_all(&bytes)?;
+
+                Ok(())
             }
-            results.push(res.bytes());
-        }
-        let results = futures::future::join_all(results).await;
-
-        for (asset, asset_data) in iter::zip(assets, results) {
-            let dest_path = dir.join(&asset.file_name);
-
-            let mut dest_file = File::create(&dest_path)?;
-
-            dest_file.write_all(&asset_data?)?;
-
-            asset.path = Some(dest_path);
+        }))
+        .buffer_unordered(4);
+        while let Some(result) = download_stream.next().await {
+            result?;
         }
 
         Ok(())
     }
 
-    async fn upload_assets(&self, client: &Client, assets: &Vec<Asset>) -> Result<()> {
-        let mut results = Vec::new();
-        for original_asset in assets {
-            let form = reqwest::multipart::Form::new()
-                .text("deviceId", original_asset.device_id.clone())
-                .text("deviceAssetId", original_asset.device_asset_id.clone())
-                .text("fileCreatedAt", original_asset.file_created_at.clone())
-                .text("fileModifiedAt", original_asset.file_modified_at.clone())
-                .file(
-                    "assetData",
-                    original_asset
-                        .path
-                        .clone()
-                        .context("Asset not downloaded")?,
-                )
-                .await?;
-
+    async fn upload_assets(&self, client: &Client, assets: &[Asset]) -> Result<()> {
+        let upload_stream = stream::iter(assets.iter().map(|original_asset| {
             let url = format!("{}/api/assets?key={}", self.base_url, self.key);
-            let res = client.post(url).multipart(form).send().await?;
-            if !res.status().is_success() {
-                bail!(
-                    "Upload failed with status {}: {}",
-                    res.status(),
-                    res.text().await?
-                );
+            async move {
+                let form = reqwest::multipart::Form::new()
+                    .text("deviceId", original_asset.device_id.clone())
+                    .text("deviceAssetId", original_asset.device_asset_id.clone())
+                    .text("fileCreatedAt", original_asset.file_created_at.clone())
+                    .text("fileModifiedAt", original_asset.file_modified_at.clone())
+                    .file(
+                        "assetData",
+                        original_asset
+                            .path
+                            .clone()
+                            .context("Asset not downloaded")?,
+                    )
+                    .await?;
+
+                let res = client.post(url).multipart(form).send().await?;
+                if !res.status().is_success() {
+                    bail!(
+                        "Upload failed with status {}: {}",
+                        res.status(),
+                        res.text().await?
+                    );
+                }
+                let response = res.json::<UploadResponse>().await?;
+
+                Ok(response)
             }
-            results.push(res.json::<UploadResponse>());
-        }
+        }))
+        .buffer_unordered(4);
 
-        let results = futures::future::join_all(results).await;
-
-        let mut ids = Vec::new();
-        for res in results {
-            let res = res?;
-            ids.push(res.id);
-        }
+        let ids: Vec<String> = upload_stream
+            .map(|response| response.map(|r| r.id))
+            .try_collect()
+            .await?;
 
         let url = format!(
             "{}/api/albums/{}/assets?key={}",
@@ -204,7 +208,7 @@ impl SharedLink {
     ) -> Result<()> {
         self.get_assets(client).await?;
         let mut missing = other.album.missing_from_other(&self.album);
-        println!("{} assets are missing", missing.len());
+        println!("Uploading {} missing assets", missing.len());
         if dry_run {
             for asset in &missing {
                 println!("Uploading asset {}", asset.file_name);
