@@ -9,35 +9,46 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Type alias to describe the config file
 type Config = HashMap<String, Peer>;
 
+/// Peer entry in the config file
 #[derive(Deserialize, Debug)]
 struct Peer {
+    /// Link to the shared album
     shared_link: String,
+
+    /// List of names of peers that this peer should download its assets from
     sync_with: Vec<String>,
 }
 
+/// Command line arguments to be parsed by clap
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// path to the config file
+    /// Path to the config file
     #[arg(short, long)]
     config: String,
 
-    /// only print missing assets
+    /// Only print missing assets
     #[arg(short, long, default_value_t = false)]
     dry_run: bool,
 }
 
+/// A shared link which can be used to download an upload assets
 #[derive(Deserialize, Debug)]
 struct SharedLink {
     album: Album,
+
+    /// Access key, parsed from a share link
     key: String,
 
+    /// Base url of an immich instance, parsed from a share link
     #[serde(skip)]
     base_url: String,
 }
 
+/// An shared album that holds a list of its assets
 #[derive(Deserialize, Debug)]
 struct Album {
     #[serde(alias = "albumName")]
@@ -48,41 +59,53 @@ struct Album {
     assets: Vec<Asset>,
 }
 
+/// An asses (e.g. image or video)
+#[derive(Deserialize, Debug, Eq, PartialEq, Hash, Clone)]
+struct Asset {
+    /// Will be parsed from a json response
+    id: String,
+
+    /// Will be parsed from a json response
+    checksum: String,
+
+    /// Will be parsed from a json response
+    #[serde(alias = "originalFileName")]
+    file_name: String,
+
+    /// Will be parsed from a json response
+    #[serde(alias = "deviceAssetId")]
+    device_asset_id: String,
+
+    /// Will be parsed from a json response
+    #[serde(alias = "deviceId")]
+    device_id: String,
+
+    /// Will be parsed from a json response
+    #[serde(alias = "fileCreatedAt")]
+    file_created_at: String,
+
+    /// Will be parsed from a json response
+    #[serde(alias = "fileModifiedAt")]
+    file_modified_at: String,
+
+    /// The location of this asset after it has been downloaded
+    path: Option<PathBuf>,
+}
+
+/// Struct to deserialize responses containing assets
 #[derive(Deserialize, Debug)]
 struct AssetResponse {
     assets: Vec<Asset>,
 }
 
+/// Struct to serialize responses from uploading assets
 #[derive(Deserialize, Debug)]
 struct UploadResponse {
     id: String,
-    // status: String,
-}
-
-#[derive(Deserialize, Debug, Eq, PartialEq, Hash, Clone)]
-struct Asset {
-    id: String,
-    checksum: String,
-
-    #[serde(alias = "originalFileName")]
-    file_name: String,
-
-    #[serde(alias = "deviceAssetId")]
-    device_asset_id: String,
-
-    #[serde(alias = "deviceId")]
-    device_id: String,
-
-    #[serde(alias = "fileCreatedAt")]
-    file_created_at: String,
-
-    #[serde(alias = "fileModifiedAt")]
-    file_modified_at: String,
-
-    path: Option<PathBuf>,
 }
 
 impl SharedLink {
+    /// Create a SharedLink by parsing the given link
     async fn new(shared_link: &str, client: &Client) -> Result<Self> {
         let mut s = shared_link.split("/share/");
         let base_url = s.next().context("Invalid share link")?;
@@ -94,6 +117,8 @@ impl SharedLink {
         shared_link.base_url = base_url.to_owned();
         Ok(shared_link)
     }
+
+    /// Fill the list of asset that are currently contained in the shared album
     async fn get_assets(&mut self, client: &Client) -> Result<()> {
         let url = format!(
             "{}/api/albums/{}?key={}",
@@ -107,6 +132,7 @@ impl SharedLink {
         Ok(())
     }
 
+    /// Download the given list of assets. The dowload path will be stored in the assets.
     async fn download_assets(
         &self,
         assets: &mut [Asset],
@@ -143,6 +169,7 @@ impl SharedLink {
         Ok(())
     }
 
+    /// Upload the given list of assets. The assets will be added to the album afterwards
     async fn upload_assets(&self, client: &Client, assets: &[Asset]) -> Result<()> {
         let upload_stream = stream::iter(assets.iter().map(|original_asset| {
             let url = format!("{}/api/assets?key={}", self.base_url, self.key);
@@ -199,6 +226,7 @@ impl SharedLink {
         Ok(())
     }
 
+    /// Upload all assets that are contained in the other SharedLink to this SharedLink.
     async fn upload_missing(
         &mut self,
         other: &Self,
@@ -208,19 +236,26 @@ impl SharedLink {
     ) -> Result<()> {
         self.get_assets(client).await?;
         let mut missing = other.album.missing_from_other(&self.album);
-        println!("Uploading {} missing assets", missing.len());
-        if dry_run {
+        if missing.is_empty() {
+            println!("No assets to synchronize");
+        } else if dry_run {
+            println!("Assets that would be synced:");
             for asset in &missing {
-                println!("Uploading asset {}", asset.file_name);
+                println!("{}", asset.file_name);
             }
+            return Ok(());
+        } else {
+            println!("Uploading {} missing assets", missing.len());
+            other.download_assets(&mut missing, client, dir).await?;
+            self.upload_assets(client, &missing).await?;
         }
-        other.download_assets(&mut missing, client, dir).await?;
-        self.upload_assets(client, &missing).await?;
+
         Ok(())
     }
 }
 
 impl Album {
+    /// Get all assets that are in the other Album but not in this album
     fn missing_from_other(&self, other: &Self) -> Vec<Asset> {
         let other_checksums: HashSet<_> = other.assets.iter().map(|a| &a.checksum).collect();
         let missing_ids: Vec<Asset> = self
